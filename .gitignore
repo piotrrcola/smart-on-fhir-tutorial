@@ -23,3 +23,4 @@ _yardoc
 doc/
 .idea/
 fan_temp_monitor/__pycache__/
+__pycache__/
