@@ -1,43 +1,43 @@
-# System Temperature & Fan Speed Monitor
+# System Temperature & Fan Speed Monitor (macOS)
 
-Reads all available hardware sensor data on Linux and displays temperatures and fan speeds in a clear, color-coded report.
+Reads all available SMC temperature and fan data on macOS, with color-coded terminal output, JSON mode, and a live watch mode.
 
 ## Data Sources
 
-| Source | What it covers |
-|---|---|
-| `/sys/class/hwmon/` | CPU, GPU, mainboard, NVMe, PSU sensors via the kernel hwmon subsystem |
-| `/sys/class/thermal/` | ACPI / kernel thermal zones |
-| `ipmitool` | Server IPMI sensors (BMC) — optional |
-| `sensors` (lm-sensors) | Cross-checks hwmon data and adds chip-specific labels — optional |
+| Source | How to get it | Notes |
+|---|---|---|
+| `powermetrics` | Built-in (ships with macOS) | Most complete — requires `sudo` |
+| `istats` | `gem install iStats` | No sudo needed |
+| `osx-cpu-temp` | `brew install osx-cpu-temp` | CPU temp only, no sudo |
 
-## Requirements
+All three are tried automatically; results are deduplicated (powermetrics wins on overlap).
 
-- Python 3.7+
-- Linux kernel with `hwmon` / `thermal` sysfs support (standard on all modern kernels)
-- *(Optional)* `lm-sensors` — `sudo apt install lm-sensors`
-- *(Optional)* `ipmitool` — `sudo apt install ipmitool` (server hardware only)
-
-## Usage
+## Quick Start
 
 ```bash
-# Basic report
-python3 fan_temp_monitor/monitor.py
+# Clone the repo and check out the branch
+git clone https://github.com/piotrrcola/smart-on-fhir-tutorial.git
+cd smart-on-fhir-tutorial
+git checkout claude/system-temp-fan-monitor-CVolA
 
-# JSON output (pipe-friendly)
-python3 fan_temp_monitor/monitor.py --json
+# Live watch — refreshes every 2 seconds (most complete output)
+sudo python3 fan_temp_monitor/monitor.py --watch 2
 
-# Continuous watch mode (refresh every 2 seconds)
+# Or without sudo (requires istats or osx-cpu-temp installed)
 python3 fan_temp_monitor/monitor.py --watch 2
+```
 
-# Custom warning/critical thresholds
-python3 fan_temp_monitor/monitor.py --warn 75 --crit 95
+## All Options
 
-# No color (for log files)
-python3 fan_temp_monitor/monitor.py --no-color
+```
+usage: monitor.py [-h] [--json] [--no-color] [--compact] [--watch SECONDS] [--warn TEMP] [--crit TEMP]
 
-# Compact (hide threshold annotations)
-python3 fan_temp_monitor/monitor.py --compact
+  --watch SECONDS   Refresh every N seconds (e.g. --watch 2)
+  --json            Machine-readable JSON output
+  --no-color        Disable ANSI colour (for log files)
+  --compact         Hide max/crit threshold annotations
+  --warn TEMP       Warning threshold °C  (default: 70)
+  --crit TEMP       Critical threshold °C (default: 90)
 ```
 
 ## Example Output
@@ -45,36 +45,28 @@ python3 fan_temp_monitor/monitor.py --compact
 ```
 === System Temperature & Fan Monitor ===
 
-  coretemp
-    Package id 0                   52.0°C  (max=100°C, crit=100°C)
-    Core 0                         48.0°C
-    Core 1                         50.0°C
-
-  nct6795
-    SYSTIN                         33.0°C
-    CPUTIN                         51.0°C
-    Fan1                           1200 RPM
-    Fan2                           980 RPM
-
-  nvme
-    Composite                      38.9°C  (crit=84°C)
+  SMC
+    CPU die temperature             68.3°C  (no threshold data from SMC)
+    GPU die temperature             55.0°C
+    CPU Proximity                   41.0°C
+    Mem Proximity                   35.0°C
+    Fan                             1800 RPM
 ```
 
-Temperatures are color-coded:
-- **Green** — normal (below `--warn` threshold, default 70 °C)
-- **Yellow** — warm (at or above `--warn`)
-- **Red** — hot (at or above `--crit`, default 90 °C)
+Colours:
+- **Green** — normal (below `--warn`, default 70 °C)
+- **Yellow** — warm (≥ `--warn`)
+- **Red** — hot (≥ `--crit`, default 90 °C)
+- **Yellow** — fan stopped / 0 RPM
+
+## Notes
+
+- **Fanless Macs** (MacBook Air M1/M2 etc.) will show no fan entries — that's expected.
+- **Apple Silicon** temperatures are available via `powermetrics`; sensor names may differ from Intel.
+- `sudo` password is cached by macOS for ~5 minutes, so `--watch` mode won't re-prompt on each refresh.
 
 ## Running Tests
 
 ```bash
-python3 -m pytest fan_temp_monitor/test_monitor.py -v
-# or
-python3 -m unittest fan_temp_monitor/test_monitor.py
+python3 -m unittest fan_temp_monitor/test_monitor.py -v
 ```
-
-## Notes
-
-- No root access is required for hwmon/thermal sysfs reads on most distros.
-- IPMI access may require root or membership in the `ipmi` group.
-- On systems without any readable sensor data the script exits with a helpful message.

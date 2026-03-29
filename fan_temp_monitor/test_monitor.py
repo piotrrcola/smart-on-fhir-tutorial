@@ -1,205 +1,243 @@
-"""Tests for fan_temp_monitor/monitor.py"""
+"""Tests for fan_temp_monitor/monitor.py (macOS)"""
 
+import io
 import json
 import os
 import sys
-import tempfile
 import unittest
-from unittest.mock import MagicMock, mock_open, patch
+from contextlib import redirect_stdout
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 
 import monitor
 
 
-class TestReadFile(unittest.TestCase):
-    def test_reads_content(self):
-        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as f:
-            f.write("  hello  \n")
-            name = f.name
-        try:
-            self.assertEqual(monitor.read_file(name), "hello")
-        finally:
-            os.unlink(name)
+# ---------------------------------------------------------------------------
+# powermetrics parsing
+# ---------------------------------------------------------------------------
 
-    def test_missing_file_returns_none(self):
-        self.assertIsNone(monitor.read_file("/nonexistent/path/file.txt"))
+POWERMETRICS_INTEL = """
+Machine model: MacBookPro16,1
+
+*** Sampled system activity ***
+
+**** SMC sensors ****
+
+Fan: 1800 rpm
+CPU die temperature: 68.31 C
+GPU die temperature: 55.00 C
+CPU Proximity: 41.00 C
+Mem Proximity: 35.00 C
+
+**** CPU Power ****
+"""
+
+POWERMETRICS_MULTI_FAN = """
+**** SMC sensors ****
+
+Fan 0: 1200 rpm
+Fan 1: 1400 rpm
+CPU die temperature: 72.50 C
+
+**** CPU Power ****
+"""
+
+POWERMETRICS_NO_FAN = """
+**** SMC sensors ****
+
+CPU die temperature: 45.00 C
+GPU die temperature: 38.00 C
+
+**** CPU Power ****
+"""
 
 
-class TestConversions(unittest.TestCase):
-    def test_millidegrees_to_celsius(self):
-        self.assertAlmostEqual(monitor.millidegrees_to_celsius("45000"), 45.0)
-        self.assertAlmostEqual(monitor.millidegrees_to_celsius("72500"), 72.5)
+class TestPowermetrics(unittest.TestCase):
+    def _parse(self, fake_output):
+        with patch("shutil.which", return_value="/usr/bin/powermetrics"):
+            with patch("os.geteuid", return_value=0):
+                with patch("monitor._run", return_value=fake_output):
+                    return monitor.get_powermetrics()
 
-    def test_millidegrees_bad_input(self):
-        self.assertIsNone(monitor.millidegrees_to_celsius("N/A"))
-        self.assertIsNone(monitor.millidegrees_to_celsius(None))
-
-    def test_rpm_value(self):
-        self.assertEqual(monitor.rpm_value("1200"), 1200)
-        self.assertEqual(monitor.rpm_value("0"), 0)
-
-    def test_rpm_bad_input(self):
-        self.assertIsNone(monitor.rpm_value("N/A"))
-        self.assertIsNone(monitor.rpm_value(None))
-
-
-class TestHwmonSensors(unittest.TestCase):
-    def _make_hwmon_tree(self, tmp_dir):
-        """Create a fake /sys/class/hwmon/hwmon0 tree."""
-        hwmon = os.path.join(tmp_dir, "hwmon0")
-        os.makedirs(hwmon)
-        # chip name
-        with open(os.path.join(hwmon, "name"), "w") as f:
-            f.write("fake_chip\n")
-        # temperature sensor
-        with open(os.path.join(hwmon, "temp1_input"), "w") as f:
-            f.write("55000\n")
-        with open(os.path.join(hwmon, "temp1_label"), "w") as f:
-            f.write("Core 0\n")
-        with open(os.path.join(hwmon, "temp1_max"), "w") as f:
-            f.write("100000\n")
-        with open(os.path.join(hwmon, "temp1_crit"), "w") as f:
-            f.write("105000\n")
-        # fan sensor
-        with open(os.path.join(hwmon, "fan1_input"), "w") as f:
-            f.write("1500\n")
-        with open(os.path.join(hwmon, "fan1_label"), "w") as f:
-            f.write("CPU Fan\n")
-        return tmp_dir
-
-    def test_reads_temp_and_fan(self):
-        import glob as _glob_module
-
-        # Capture the real function before any mocking touches it
-        _real_glob = _glob_module.glob.__wrapped__ if hasattr(_glob_module.glob, "__wrapped__") else _glob_module.glob
-
-        with tempfile.TemporaryDirectory() as tmp:
-            self._make_hwmon_tree(tmp)
-            hwmon0 = os.path.join(tmp, "hwmon0")
-
-            # Build the return values using os.glob directly via fnmatch
-            import fnmatch
-
-            def fake_glob(pattern):
-                if pattern == "/sys/class/hwmon/hwmon*":
-                    return [hwmon0]
-                # Map /sys/class/hwmon/hwmon0/... -> tmp/hwmon0/...
-                local_pattern = pattern.replace("/sys/class/hwmon/hwmon0", hwmon0)
-                base_dir = os.path.dirname(local_pattern)
-                file_pattern = os.path.basename(local_pattern)
-                try:
-                    entries = os.listdir(base_dir)
-                except OSError:
-                    return []
-                return sorted(
-                    os.path.join(base_dir, e)
-                    for e in entries
-                    if fnmatch.fnmatch(e, file_pattern)
-                )
-
-            with patch("monitor.glob.glob", side_effect=fake_glob):
-                result = monitor.get_hwmon_sensors()
-
-        self.assertEqual(len(result["temperatures"]), 1)
-        t = result["temperatures"][0]
-        self.assertEqual(t["chip"], "fake_chip")
-        self.assertEqual(t["label"], "Core 0")
-        self.assertAlmostEqual(t["celsius"], 55.0)
-        self.assertAlmostEqual(t["max"], 100.0)
-        self.assertAlmostEqual(t["crit"], 105.0)
-
+    def test_single_fan_and_temps(self):
+        result = self._parse(POWERMETRICS_INTEL)
         self.assertEqual(len(result["fans"]), 1)
-        f = result["fans"][0]
-        self.assertEqual(f["chip"], "fake_chip")
-        self.assertEqual(f["label"], "CPU Fan")
-        self.assertEqual(f["rpm"], 1500)
+        self.assertEqual(result["fans"][0]["rpm"], 1800)
+        labels = [t["label"] for t in result["temperatures"]]
+        self.assertIn("CPU die temperature", labels)
+        self.assertIn("GPU die temperature", labels)
+        self.assertIn("CPU Proximity", labels)
+        self.assertIn("Mem Proximity", labels)
 
+    def test_multi_fan(self):
+        result = self._parse(POWERMETRICS_MULTI_FAN)
+        self.assertEqual(len(result["fans"]), 2)
+        rpms = {f["label"]: f["rpm"] for f in result["fans"]}
+        self.assertEqual(rpms["Fan 0"], 1200)
+        self.assertEqual(rpms["Fan 1"], 1400)
 
-class TestThermalZones(unittest.TestCase):
-    def test_reads_thermal_zone(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            zone = os.path.join(tmp, "thermal_zone0")
-            os.makedirs(zone)
-            with open(os.path.join(zone, "type"), "w") as f:
-                f.write("x86_pkg_temp\n")
-            with open(os.path.join(zone, "temp"), "w") as f:
-                f.write("60000\n")
-
-            with patch("monitor.glob.glob", return_value=[zone]):
-                result = monitor.get_thermal_zones()
-
-        self.assertEqual(len(result), 1)
-        self.assertAlmostEqual(result[0]["celsius"], 60.0)
-        self.assertEqual(result[0]["chip"], "x86_pkg_temp")
-
-    def test_missing_temp_file_skipped(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            zone = os.path.join(tmp, "thermal_zone0")
-            os.makedirs(zone)
-            with open(os.path.join(zone, "type"), "w") as f:
-                f.write("acpitz\n")
-            # no temp file
-
-            with patch("monitor.glob.glob", return_value=[zone]):
-                result = monitor.get_thermal_zones()
-
-        self.assertEqual(result, [])
-
-
-class TestIpmiSensors(unittest.TestCase):
-    def test_no_ipmitool(self):
-        with patch("shutil.which", return_value=None):
-            result = monitor.get_ipmi_sensors()
-        self.assertEqual(result, {"temperatures": [], "fans": []})
-
-    def test_parses_temperature_output(self):
-        temp_output = (
-            "Inlet Temp       | 04h | ok  |  7.1 | 22 degrees C\n"
-            "CPU1 Temp        | 0Eh | ok  |  3.1 | 48 degrees C\n"
-        )
-        fan_output = "FAN1             | 41h | ok  | 29.1 | 3600 RPM\n"
-
-        with patch("shutil.which", return_value="/usr/bin/ipmitool"):
-            with patch("subprocess.check_output", side_effect=[
-                temp_output.encode(), fan_output.encode()
-            ]):
-                result = monitor.get_ipmi_sensors()
-
+    def test_fanless_mac(self):
+        result = self._parse(POWERMETRICS_NO_FAN)
+        self.assertEqual(result["fans"], [])
         self.assertEqual(len(result["temperatures"]), 2)
-        self.assertAlmostEqual(result["temperatures"][0]["celsius"], 22.0)
-        self.assertEqual(len(result["fans"]), 1)
-        self.assertEqual(result["fans"][0]["rpm"], 3600)
 
+    def test_celsius_values(self):
+        result = self._parse(POWERMETRICS_INTEL)
+        cpu = next(t for t in result["temperatures"] if t["label"] == "CPU die temperature")
+        self.assertAlmostEqual(cpu["celsius"], 68.31)
+
+    def test_no_powermetrics_binary(self):
+        with patch("shutil.which", return_value=None):
+            result = monitor.get_powermetrics()
+        self.assertEqual(result["temperatures"], [])
+        self.assertEqual(result["fans"], [])
+
+    def test_run_failure_returns_empty(self):
+        with patch("shutil.which", return_value="/usr/bin/powermetrics"):
+            with patch("os.geteuid", return_value=0):
+                with patch("monitor._run", return_value=None):
+                    result = monitor.get_powermetrics()
+        self.assertEqual(result["temperatures"], [])
+
+    def test_chip_name_is_smc(self):
+        result = self._parse(POWERMETRICS_INTEL)
+        for t in result["temperatures"]:
+            self.assertEqual(t["chip"], "SMC")
+        for f in result["fans"]:
+            self.assertEqual(f["chip"], "SMC")
+
+
+# ---------------------------------------------------------------------------
+# istats parsing
+# ---------------------------------------------------------------------------
+
+ISTATS_OUTPUT = """
+--- CPU Stats ---
+CPU temp:         52.9°C    ▁▂▃▅▆▇
+
+--- Fan Stats ---
+Total fans in system:  2
+Fan 0 speed:      1196 RPM ▁▂▃▄▅▆▇
+Fan 1 speed:      1200 RPM ▁▂▃▄▅▆▇
+
+--- Battery Stats ---
+Battery temp:     29.5°C
+"""
+
+ISTATS_NO_GRAPHS = """
+--- CPU Stats ---
+CPU temp:         60.1°C
+
+--- Fan Stats ---
+Total fans in system:  1
+Fan 0 speed:      2000 RPM
+
+--- Extra Stats ---
+GPU temp:         55.0°C
+"""
+
+
+class TestIstats(unittest.TestCase):
+    def _parse(self, fake_output):
+        with patch("shutil.which", return_value="/usr/local/bin/istats"):
+            with patch("monitor._run", return_value=fake_output):
+                return monitor.get_istats()
+
+    def test_cpu_temp_and_fans(self):
+        result = self._parse(ISTATS_OUTPUT)
+        temps = {t["label"]: t["celsius"] for t in result["temperatures"]}
+        self.assertIn("CPU temp", temps)
+        self.assertAlmostEqual(temps["CPU temp"], 52.9)
+        self.assertEqual(len(result["fans"]), 2)
+        rpms = {f["label"]: f["rpm"] for f in result["fans"]}
+        self.assertEqual(rpms["Fan 0 speed"], 1196)
+        self.assertEqual(rpms["Fan 1 speed"], 1200)
+
+    def test_battery_stats_not_included(self):
+        """Battery section should not be parsed as temperatures."""
+        result = self._parse(ISTATS_OUTPUT)
+        labels = [t["label"] for t in result["temperatures"]]
+        self.assertNotIn("Battery temp", labels)
+
+    def test_extra_stats_gpu(self):
+        result = self._parse(ISTATS_NO_GRAPHS)
+        labels = [t["label"] for t in result["temperatures"]]
+        self.assertIn("GPU temp", labels)
+
+    def test_no_istats_binary(self):
+        with patch("shutil.which", return_value=None):
+            result = monitor.get_istats()
+        self.assertEqual(result["temperatures"], [])
+        self.assertEqual(result["fans"], [])
+
+
+# ---------------------------------------------------------------------------
+# osx-cpu-temp parsing
+# ---------------------------------------------------------------------------
+
+class TestOsxCpuTemp(unittest.TestCase):
+    def test_parses_temperature(self):
+        with patch("shutil.which", return_value="/usr/local/bin/osx-cpu-temp"):
+            with patch("monitor._run", return_value="52.0°C\n"):
+                result = monitor.get_osx_cpu_temp()
+        self.assertEqual(len(result["temperatures"]), 1)
+        self.assertAlmostEqual(result["temperatures"][0]["celsius"], 52.0)
+
+    def test_no_binary(self):
+        with patch("shutil.which", return_value=None):
+            result = monitor.get_osx_cpu_temp()
+        self.assertEqual(result["temperatures"], [])
+
+    def test_handles_plain_number(self):
+        with patch("shutil.which", return_value="/usr/local/bin/osx-cpu-temp"):
+            with patch("monitor._run", return_value="63.5 C\n"):
+                result = monitor.get_osx_cpu_temp()
+        self.assertAlmostEqual(result["temperatures"][0]["celsius"], 63.5)
+
+
+# ---------------------------------------------------------------------------
+# Deduplication
+# ---------------------------------------------------------------------------
 
 class TestDeduplication(unittest.TestCase):
-    def test_deduplicates_temps(self):
-        with patch("monitor.get_hwmon_sensors", return_value={
-            "temperatures": [{"chip": "k10temp", "label": "Tdie", "celsius": 50.0, "crit": None, "max": None, "source": "hwmon"}],
-            "fans": [],
-        }):
-            with patch("monitor.get_thermal_zones", return_value=[
-                {"chip": "k10temp", "label": "Tdie", "celsius": 51.0, "crit": None, "max": None, "source": "thermal_zone"},
-            ]):
-                with patch("monitor.get_ipmi_sensors", return_value={"temperatures": [], "fans": []}):
-                    with patch("monitor.get_lm_sensors", return_value={"temperatures": [], "fans": []}):
-                        temps, fans = monitor.collect_all()
+    def test_same_chip_label_deduplicated(self):
+        pm = {
+            "temperatures": [{"chip": "SMC", "label": "CPU die temperature", "celsius": 68.0, "crit": None, "max": None}],
+            "fans": [{"chip": "SMC", "label": "Fan", "rpm": 1800}],
+            "source": "powermetrics",
+        }
+        ist = {
+            "temperatures": [{"chip": "SMC", "label": "CPU die temperature", "celsius": 69.0, "crit": None, "max": None}],
+            "fans": [{"chip": "SMC", "label": "Fan", "rpm": 1850}],
+            "source": "istats",
+        }
+        with patch("monitor.get_powermetrics", return_value=pm):
+            with patch("monitor.get_istats", return_value=ist):
+                with patch("monitor.get_osx_cpu_temp", return_value={"temperatures": [], "fans": [], "source": "osx-cpu-temp"}):
+                    temps, fans = monitor.collect_all()
 
-        # Duplicate chip+label pair should appear only once (first wins)
-        matching = [t for t in temps if t["chip"].lower() == "k10temp" and t["label"].lower() == "tdie"]
-        self.assertEqual(len(matching), 1)
-        self.assertAlmostEqual(matching[0]["celsius"], 50.0)
+        cpu_temps = [t for t in temps if t["label"] == "CPU die temperature"]
+        self.assertEqual(len(cpu_temps), 1)
+        self.assertAlmostEqual(cpu_temps[0]["celsius"], 68.0)  # first source wins
 
+        fan_entries = [f for f in fans if f["label"] == "Fan"]
+        self.assertEqual(len(fan_entries), 1)
+        self.assertEqual(fan_entries[0]["rpm"], 1800)
+
+
+# ---------------------------------------------------------------------------
+# Formatting
+# ---------------------------------------------------------------------------
 
 class TestColorize(unittest.TestCase):
     def test_no_color(self):
-        result = monitor.colorize("test", monitor.COLOR_RED, False)
-        self.assertEqual(result, "test")
+        self.assertEqual(monitor.colorize("hi", monitor.COLOR_RED, False), "hi")
 
     def test_with_color(self):
-        result = monitor.colorize("test", monitor.COLOR_RED, True)
-        self.assertIn("\033[", result)
-        self.assertIn("test", result)
+        out = monitor.colorize("hi", monitor.COLOR_RED, True)
+        self.assertIn("\033[", out)
+        self.assertIn("hi", out)
 
 
 class TestTempColor(unittest.TestCase):
@@ -208,8 +246,8 @@ class TestTempColor(unittest.TestCase):
         monitor.TEMP_CRIT = 90.0
 
     def test_normal(self):
-        out = monitor.temp_color(50.0, False)
-        self.assertIn("50.0", out)
+        out = monitor.temp_color(50.0, True)
+        self.assertIn(monitor.COLOR_GREEN, out)
 
     def test_warning(self):
         out = monitor.temp_color(75.0, True)
@@ -221,21 +259,31 @@ class TestTempColor(unittest.TestCase):
 
 
 class TestPrintJson(unittest.TestCase):
-    def test_valid_json_output(self):
-        temps = [{"chip": "test", "label": "Sensor", "celsius": 42.0, "crit": None, "max": None, "source": "hwmon"}]
-        fans = [{"chip": "test", "label": "Fan1", "rpm": 900, "source": "hwmon"}]
-        import io
-        from contextlib import redirect_stdout
-
+    def test_valid_json(self):
+        temps = [{"chip": "SMC", "label": "CPU die temperature", "celsius": 55.0, "crit": None, "max": None, "source": "powermetrics"}]
+        fans  = [{"chip": "SMC", "label": "Fan", "rpm": 1800, "source": "powermetrics"}]
         buf = io.StringIO()
         with redirect_stdout(buf):
             monitor.print_json(temps, fans)
-
         data = json.loads(buf.getvalue())
-        self.assertIn("temperatures", data)
-        self.assertIn("fans", data)
-        self.assertEqual(data["temperatures"][0]["celsius"], 42.0)
-        self.assertEqual(data["fans"][0]["rpm"], 900)
+        self.assertEqual(data["temperatures"][0]["celsius"], 55.0)
+        self.assertEqual(data["fans"][0]["rpm"], 1800)
+
+
+class TestPrintReport(unittest.TestCase):
+    def test_stopped_fan_label(self):
+        fans  = [{"chip": "SMC", "label": "Fan", "rpm": 0, "source": "powermetrics"}]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            monitor.print_report([], fans, use_color=False)
+        self.assertIn("stopped", buf.getvalue())
+
+    def test_report_contains_temp_value(self):
+        temps = [{"chip": "SMC", "label": "CPU die temperature", "celsius": 55.3, "crit": None, "max": None, "source": "powermetrics"}]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            monitor.print_report(temps, [], use_color=False)
+        self.assertIn("55.3", buf.getvalue())
 
 
 if __name__ == "__main__":
